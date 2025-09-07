@@ -6,7 +6,9 @@
 
 ## 目录
 - 网络连接与状态（`NetcodeHelper`）
+- 网络拓扑与路由/中继要求
 - 可序列化姿态（`NetworkPose`）
+- 消息与状态同步机制（RPC / NetworkVariable / NetworkTransform）
 - 网络对象池与 Prefab Handler（`NetworkObjectPool`）
 - 连接态 UI 辅助（`ActiveIfConnected` / `InteractiveIfConnected`）
 - 局域网中的"地形/环境交互"说明（`Bullet` + `EnvironmentMapper`）
@@ -208,6 +210,89 @@ public void NetworkSerialize<T>(BufferSerializer<T> serializer) where T : IReade
 
 ---
 
+## 消息与状态同步机制（RPC / NetworkVariable / NetworkTransform）
+
+- RPC（事件/命令广播）：使用 NGO 的新式 `[Rpc(SendTo...)]` 方法向所有人或特定对象所有者发送事件。例如伤害与击杀：
+
+```csharp
+[Rpc(SendTo.Everyone)]
+public void DamageRpc(float damage, ulong damagedBy)
+{
+    if(IsOwner)
+        MainPlayer.Instance.Damage(damage, damagedBy);
+
+    onDamaged.Invoke();
+}
+```
+
+```csharp
+[Rpc(SendTo.Everyone)]
+private void HitRpc(Vector3 pos, Vector3 norm)
+{
+    transform.position = pos;
+    transform.up = norm;
+    isAlive = false;
+    OnCollide.Invoke();
+    AudioSource.PlayClipAtPoint(collideSFX, transform.position);
+    if (IsOwner)
+    {
+        StartCoroutine(D());
+        IEnumerator D() { yield return new WaitForSeconds(despawnDelay); NetworkObject.Despawn(); }
+    }
+}
+```
+
+```csharp
+[Rpc(SendTo.Owner)]
+public void ScoreTeamRpc(byte team, int points)
+{
+    if (State != MatchState.Playing) return;
+    if (team == 0 || points == 0) return;
+    teamScoresSync[team].Value += points;
+    TeamScored.Invoke(team);
+    bool canWinByScore = Settings.CheckWinByPoints();
+    bool isPlaying = State == MatchState.Playing;
+    bool isWinningScore = GetTeamScore(team) > Settings.scoreTarget;
+    if (isPlaying && canWinByScore && isWinningScore)
+    {
+        winByScoreCompletion.SetResult(true);
+    }
+}
+```
+
+- NetworkVariable（持续状态同步）：用于同步长驻状态，如队伍、比分、对局状态与设置、子弹初始姿态等，支持变更回调：
+
+```csharp
+public NetworkVariable<byte> teamSync;
+private void Awake()
+{
+    teamSync.OnValueChanged += delegate { OnTeamChange.Invoke(Team); };
+}
+```
+
+```csharp
+private NetworkVariable<NetworkPose> spawnPoseSync = new();
+public override void OnNetworkSpawn()
+{
+    if (IsOwner)
+        spawnPoseSync.Value = new NetworkPose(transform);
+    else
+        SetPose(spawnPoseSync.Value);
+}
+```
+
+```csharp
+private NetworkVariable<MatchState> stateSync = new(MatchState.NotPlaying);
+private NetworkVariable<MatchSettings> settingsSync = new();
+private NetworkVariable<int>[] teamScoresSync;
+```
+
+- NetworkTransform / 位姿同步：角色与场景网络对象在 Prefab 上挂 `NetworkTransform` 进行位置/旋转同步；此外，项目通过 `NetworkPose` 序列化结构补充传输初始/关键姿态（如子弹的 Spawn 姿态），并结合 Owner 侧本地推进与事件型 RPC（如 `HitRpc`）统一表现。
+
+- 说明：项目未使用 `CustomMessagingManager` 的自定义 Named Message；主要同步手段是 RPC + NetworkVariable + NetworkTransform 的组合。
+
+---
+
 ## 网络对象池与 Prefab Handler：`Anaglyph/Netcode/NetworkObjectPool.cs`
 
 职责概述：
@@ -256,6 +341,27 @@ void INetworkPrefabInstanceHandler.Destroy(NetworkObject networkObject)
 {
     m_Pool.ReturnNetworkObject(networkObject, m_Prefab);
 }
+```
+
+什么是池化路线？
+
+- 定义：生成/销毁网络对象不再直接用 `Instantiate/Destroy`，而是从对象池取用并在回收时归还，实现复用，降低分配与回收开销。
+- 在本项目中的路径：由 `NetworkObjectPool` 预注册/预热 Prefab，并通过 `NetworkManager.Singleton.PrefabHandler.AddHandler(...)` 拦截 Netcode 的 Spawn/Destroy，使服务器与客户端都走相同的池化实例化/回收逻辑。
+- 好处：
+  - 性能更稳：减少 GC 与 `Instantiate/Destroy` 的频繁抖动，提升帧率与吞吐。
+  - 行为一致：统一由 PrefabHandler 管理实例创建/销毁路径。
+- 适用对象：高频且短生命周期的网络对象（如子弹、命中特效、抛射物等）。
+- 注意事项：
+  - Prefab 必须包含 `NetworkObject`。
+  - 服务器发起 Spawn；客户端不要直接操作池。
+  - 归还前需重置对象状态；预热数量应覆盖峰值需求。
+- 最小用法示例（服务器侧）：
+
+```csharp
+var no = NetworkObjectPool.Instance.GetNetworkObject(bulletPrefab, position, rotation);
+no.SpawnWithOwnership(OwnerClientId); // 池化路线生成
+// ... 使用完毕后
+no.Despawn(); // Netcode 触发自定义 Destroy Handler，把对象归还到池
 ```
 
 结论：
