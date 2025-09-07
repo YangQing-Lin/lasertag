@@ -123,6 +123,48 @@ private static async Task ConnectUnityServices(string id, CancellationToken ct)
 - 云模式下走分布式权限传输与 Unity Services，会话由 `SessionOptions` 管理。
 - 连接状态机与事件回调集中于 `NetcodeHelper`，UI 可订阅 `StateChange` 进行反馈。
 
+## 网络拓扑与路由/中继要求
+
+- LAN（局域网直连，UnityTransport）
+  - 拓扑：主机权威（Host Authoritative）的星型拓扑，`StartHost()` 的设备既是权威也充当转发点，客户端用 `StartClient()` 直连主机。
+  - 端口：默认 UDP 7777，可在代码中调整：
+
+`Assets/Anaglyph/Netcode/NetcodeHelper.cs` (行 16-24)
+```csharp
+public static ushort port = 7777;
+...
+private static UnityTransport transport => (UnityTransport)NetworkManager.Singleton.NetworkConfig.NetworkTransport;
+```
+
+  - 传输配置：LAN 下强制使用 `UnityTransport` 且禁用 CMB 服务：
+
+`Assets/Anaglyph/Netcode/NetcodeHelper.cs` (行 98-106, 114-116, 126-136)
+```csharp
+SetNetworkTransportType("UnityTransport");
+manager.NetworkConfig.UseCMBService = false;
+...
+transport.SetConnectionData(localAddressOrIp, port);
+manager.StartHost(); // 或 StartClient()
+```
+
+  - 路由/防火墙：无需额外“专用路由器/中继设备”。同一局域网内即可通信；需确保主机防火墙放行 UDP 7777（或所配置端口）。若要跨公网直连主机，则需要自行进行端口映射/UPnP，项目未内置公网 Relay。
+
+- Unity Services（分布式权限网络，DistributedAuthorityTransport）
+  - 拓扑：通过 Unity Services Multiplayer 的分布式权限网络建立覆盖连接，无单一自建专服；服务侧负责 NAT 穿透/中继。
+  - 传输与会话：
+
+`Assets/Anaglyph/Netcode/NetcodeHelper.cs` (行 158-163, 178-186)
+```csharp
+SetNetworkTransportType("DistributedAuthorityTransport");
+manager.NetworkConfig.UseCMBService = true;
+...
+var options = new SessionOptions(){ Name = id, MaxPlayers = 20, }
+    .WithDistributedAuthorityNetwork();
+CurrentSession = await MultiplayerService.Instance.CreateOrJoinSessionAsync(id, options);
+```
+
+  - 路由需求：不需要自备路由/中继或端口映射，只要设备能够访问互联网即可（企业/校园网络需允许访问 Unity 服务域名与相关端口）。
+
 ---
 
 ## 可序列化姿态：`Anaglyph/Netcode/NetworkPose.cs`
@@ -295,6 +337,7 @@ public static bool Raycast(Ray ray, float maxDist, out RayResult result, bool fa
 ---
 
 ## 小结
-- 连接：`NetcodeHelper` 统一封装 LAN 与 Unity Services，管理状态与冷却；LAN 使用 `UnityTransport` 与 IP:Port 直连。
+- 连接：`NetcodeHelper` 统一封装 LAN 与 Unity Services，管理状态与冷却；LAN 使用 `UnityTransport` 与 IP:Port 直连；云端使用 `DistributedAuthorityTransport` + Unity Services 分布式权限会话。
 - 资源：`NetworkObjectPool` 作为 Netcode 的 Prefab Handler，完成网络对象的池化获取与归还，显著降低运行时开销。
 - 地形/环境：不做网络同步；通过本地 `EnvironmentMapper` 的深度体素射线完成命中推断，命中事件用 RPC 同步表现。
+- 路由与中继：两种模式均无需额外“专用路由器/中继设备”。LAN 需同网段并放行 UDP 7777；云端由 Unity 服务侧处理 NAT 穿透/中继（仅要求可访问互联网）。
